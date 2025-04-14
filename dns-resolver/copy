@@ -2,7 +2,6 @@ import dgram from 'dgram';
 import dns from 'dns';
 import Redis from 'ioredis';
 import fetch from 'node-fetch';
-import { createHash } from 'crypto';
 
 const LOCAL_DNS_PORT = 3000;
 const REDIS_HOST = 'redis-server';
@@ -12,34 +11,32 @@ const redis = new Redis({ host: REDIS_HOST, port: REDIS_PORT });
 
 const server = dgram.createSocket('udp4');
 
-const hashToFixedLength = (input: string, length = 64) => {
-  const hash = createHash('sha256').update(input).digest('hex');
-  return hash.slice(0, length);
-}
-
 const extractDomainFromQuery = (msg: Buffer): string | null => {
   let domain = '';
-  let offset = 12;
+  let offset = 12; // DNS header is 12 bytes
   while (msg[offset] !== 0) {
     const length = msg[offset];
     domain += msg.subarray(offset + 1, offset + 1 + length).toString() + '.';
     offset += length + 1;
   }
-  return domain.slice(0, -1);
+  return domain.slice(0, -1); // Remove trailing dot
 };
 
 const createDnsResponse = (query: Buffer, ip: string): Buffer => {
-  const response = Buffer.alloc(query.length + 16);
-  query.copy(response);
+  const response = Buffer.alloc(query.length + 16); // Rough size estimation
+  query.copy(response); // Copy original query
 
+  // Set response flags (standard response, recursion available)
   response[2] = 0x81;
   response[3] = 0x80;
 
+  // Answer count = 1
   response[6] = 0x00;
   response[7] = 0x01;
 
+  // Append answer section
   const answerStart = query.length;
-  response[answerStart] = 0xc0;
+  response[answerStart] = 0xc0; // Pointer to question section
   response[answerStart + 1] = 0x0c;
   response[answerStart + 2] = 0x00; // Type A (IPv4)
   response[answerStart + 3] = 0x01;
@@ -52,6 +49,7 @@ const createDnsResponse = (query: Buffer, ip: string): Buffer => {
   response[answerStart + 10] = 0x00; // Data length (IPv4 = 4 bytes)
   response[answerStart + 11] = 0x04;
 
+  // Convert IP to bytes
   const ipParts = ip.split('.').map(Number);
   response[answerStart + 12] = ipParts[0];
   response[answerStart + 13] = ipParts[1];
@@ -63,44 +61,33 @@ const createDnsResponse = (query: Buffer, ip: string): Buffer => {
 
 
 const extractIpFromResponse = (response: Buffer): string | null => {
-  let offset = 12;
+  let offset = 12; // Start after the DNS header
 
+  // Skip the Question section
   while (response[offset] !== 0) {
     offset += response[offset] + 1;
   }
-  offset += 5;
+  offset += 5; // Skip null terminator (0x00) and QTYPE + QCLASS (4 bytes)
 
+  // Start of Answer section
   if (response[offset] !== 0xc0) {
-    return null;
+    return null; // Ensure it's a valid answer
   }
-  offset += 2;
+  offset += 2; // Skip pointer to question
 
   offset += 2; // Skip TYPE (A record = 1)
   offset += 2; // Skip CLASS (IN = 1)
   offset += 4; // Skip TTL
   offset += 2; // Skip RDLENGTH
 
+  // Extract IPv4 address (last 4 bytes)
   const ip = `${response[offset]}.${response[offset + 1]}.${response[offset + 2]}.${response[offset + 3]}`;
   return ip;
 };
 
 
-const printCache = async () => {
-  console.log(`================ Current Cache ===================\n `)
-
-  const keys = await redis.keys("*");
-  for (const key of keys) {
-    const value = await redis.get(key);
-    if (!value) return;
-    const hashedValue = hashToFixedLength(value);
-    console.log(`  ${key} - ${hashedValue} \n`)
-  }
-}
-
 server.on('message', async (msg, rinfo) => {
   console.log(`Received DNS query from ${rinfo.address}:${rinfo.port}`);
-
-  printCache();
 
   const domain = extractDomainFromQuery(msg);
   if (!domain) {
@@ -122,13 +109,15 @@ server.on('message', async (msg, rinfo) => {
   }
 
 
+  // Get system DNS resolver dynamically
   const systemResolvers = dns.getServers();
   if (systemResolvers.length === 0) {
     console.error('No system DNS resolvers found.');
     return;
   }
-  const forwardDnsServer = systemResolvers[0];
+  const forwardDnsServer = systemResolvers[0]; // Use the first available resolver
 
+  // Forward the request to the actual DNS resolver
   const forwardSocket = dgram.createSocket('udp4');
   forwardSocket.send(msg, 53, forwardDnsServer);
 
@@ -139,22 +128,20 @@ server.on('message', async (msg, rinfo) => {
     console.log(response);
     console.log(resolvedIp);
     if (resolvedIp && resolvedIp !== '0.0.0.0') {
-      await redis.setex(domain, 3600, resolvedIp);
+      await redis.setex(domain, 60, resolvedIp);
 
     }
 
     try {
-      const res = await fetch(`http://${domain}`);
+      const res = await fetch(`http://${domain}`); // Fetch website HTML
       if (res.ok) {
         const html = await res.text();
         console.log(`Fetched HTML from ${domain}, caching it.`);
-        await redis.setex(`html-${domain}`, 3600, html);
+        await redis.setex(`html-${domain}`, 60, html);
       }
     } catch (err) {
       console.error(`Failed to fetch HTML from ${domain}:`, err);
     }
-
-    printCache();
 
     server.send(response, rinfo.port, rinfo.address);
     forwardSocket.close();

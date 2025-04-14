@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  redis-server:
+    image: redis:alpine
+    ports:
+      - "6379:6379"
+    networks:
+      - cdn-network
+
+  peer1:
+    build: .
+    ports:
+      - "3001:3000/udp"
+    environment:
+      - PEER_NAME=peer1
+    networks:
+      - cdn-network
+    depends_on:
+      - redis-server
+
+  peer2:
+    build: .
+    ports:
+      - "3002:3000/udp"
+    environment:
+      - PEER_NAME=peer2
+    networks:
+      - cdn-network
+    depends_on:
+      - redis-server
+
+networks:
+  cdn-network:
+    driver: bridge
